@@ -30,8 +30,6 @@ make test
 LD_PRELOAD=./libprofiler.so ./your_program
 ```
 
-See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed instructions.
-
 ## How It Works
 
 The profiler uses **LD_PRELOAD** to intercept memory allocation functions before your program calls them:
@@ -94,19 +92,3 @@ This codebase follows these principles:
 - GCC or Clang
 - GNU Make
 
-## Contributing
-
-This is an educational project demonstrating systems programming concepts:
-- Dynamic linking and LD_PRELOAD
-- Memory management and tracking
-- Hash tables for efficient lookups
-- Library interposition
-
-## License
-
-MIT License - feel free to use and modify.
-
-## Learn More
-
-- See [CMemoryLeaker.md](CMemoryLeaker.md) for the full project specification
-- See [BUILD_GUIDE.md](BUILD_GUIDE.md) for build instructions
