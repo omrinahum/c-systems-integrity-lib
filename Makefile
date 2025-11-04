@@ -17,18 +17,22 @@ LDFLAGS = -shared -ldl
 PROFILER_LIB = libprofiler.so
 TEST_LEAK = tests/test_simple_leak
 TEST_NO_LEAK = tests/test_no_leak
+TEST_COMPLEX = tests/test_complex_leak
+TEST_DOUBLE_FREE = tests/test_double_free
+TEST_INVALID_FREE = tests/test_invalid_free
 
 # Source files
 PROFILER_SOURCES = src/malloc_intercept.c src/hash_table.c src/profiler.c
 PROFILER_OBJECTS = $(PROFILER_SOURCES:.c=.o)
 
 # Default target - build everything
-all: $(PROFILER_LIB) $(TEST_LEAK) $(TEST_NO_LEAK)
+all: $(PROFILER_LIB) $(TEST_LEAK) $(TEST_NO_LEAK) $(TEST_COMPLEX) $(TEST_DOUBLE_FREE) $(TEST_INVALID_FREE)
 	@echo ""
 	@echo "Build complete!"
 	@echo "==============="
 	@echo "Profiler library: $(PROFILER_LIB)"
-	@echo "Test programs: $(TEST_LEAK), $(TEST_NO_LEAK)"
+	@echo "Test programs: $(TEST_LEAK), $(TEST_NO_LEAK), $(TEST_COMPLEX)"
+	@echo "               $(TEST_DOUBLE_FREE), $(TEST_INVALID_FREE)"
 	@echo ""
 	@echo "To run tests:"
 	@echo "  make test"
@@ -55,6 +59,18 @@ $(TEST_NO_LEAK): tests/test_no_leak.c
 	@echo "Building test program: $@"
 	$(CC) -g -rdynamic $< -o $@
 
+$(TEST_COMPLEX): tests/test_complex_leak.c
+	@echo "Building test program: $@"
+	$(CC) -g -rdynamic $< -o $@
+
+$(TEST_DOUBLE_FREE): tests/test_double_free.c
+	@echo "Building test program: $@"
+	$(CC) -g -rdynamic $< -o $@
+
+$(TEST_INVALID_FREE): tests/test_invalid_free.c
+	@echo "Building test program: $@"
+	$(CC) -g -rdynamic $< -o $@
+
 # Run tests with the profiler
 test: all
 	@echo ""
@@ -69,13 +85,31 @@ test: all
 	@echo "=========================================="
 	LD_PRELOAD=./$(PROFILER_LIB) ./$(TEST_NO_LEAK)
 	@echo ""
+	@echo ""
+	@echo "=========================================="
+	@echo "TEST 3: Complex Leak Detection"
+	@echo "=========================================="
+	LD_PRELOAD=./$(PROFILER_LIB) ./$(TEST_COMPLEX)
+	@echo ""
+	@echo ""
+	@echo "=========================================="
+	@echo "TEST 4: Double-Free Detection"
+	@echo "=========================================="
+	LD_PRELOAD=./$(PROFILER_LIB) ./$(TEST_DOUBLE_FREE)
+	@echo ""
+	@echo ""
+	@echo "=========================================="
+	@echo "TEST 5: Invalid-Free Detection"
+	@echo "=========================================="
+	LD_PRELOAD=./$(PROFILER_LIB) ./$(TEST_INVALID_FREE)
+	@echo ""
 
 # Clean build artifacts
 clean:
 	@echo "Cleaning build files..."
 	rm -f $(PROFILER_OBJECTS)
 	rm -f $(PROFILER_LIB)
-	rm -f $(TEST_LEAK) $(TEST_NO_LEAK)
+	rm -f $(TEST_LEAK) $(TEST_NO_LEAK) $(TEST_COMPLEX) $(TEST_DOUBLE_FREE) $(TEST_INVALID_FREE)
 	@echo "Clean complete"
 
 # Phony targets (not actual files)

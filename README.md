@@ -2,20 +2,24 @@
 
 A low-level C library for Linux that automatically detects memory leaks, double-free errors, file descriptor leaks, and concurrency deadlocks in C/C++ applications **without recompilation**.
 
-## Current Status: Phase 1 ✓
+## Current Status: Phase 6 ✓
 
 **Working Features:**
 - ✅ malloc/free/calloc/realloc interception via LD_PRELOAD
-- ✅ Memory leak detection
-- ✅ Leak reporting at program exit
-- ✅ Works on any dynamically-linked C/C++ program
+- ✅ Memory leak detection with O(1) hash table (uthash)
+- ✅ Stack trace capture showing allocation sites
+- ✅ Thread-safe operation with pthread mutexes
+- ✅ False positive filtering (libc infrastructure detection)
+- ✅ Double-free detection
+- ✅ Invalid-free detection (stack vars, random addresses, etc.)
+- ✅ Clean, minimal output format
+- ✅ Comprehensive test suite (5 tests)
 
 **Coming Soon:**
-- 🔄 Stack traces (show source code location of leaks)
-- 🔄 Thread safety (proper multi-threaded support)
-- 🔄 Double-free and invalid-free detection
+- 🔄 Symbol resolution (addr2line for readable stack traces)
 - 🔄 File descriptor leak detection
 - 🔄 Deadlock detection
+- 🔄 JSON/HTML report generation
 
 ## Quick Start
 
@@ -26,9 +30,20 @@ make
 # Test it
 make test
 
-# Use on your program
+# Use on your program (with stack traces - default)
 LD_PRELOAD=./libprofiler.so ./your_program
+
+# Disable stack traces for cleaner output
+PROFILER_STACK_TRACES=0 LD_PRELOAD=./libprofiler.so ./your_program
 ```
+
+## Configuration
+
+Control profiler behavior with environment variables:
+
+- `PROFILER_STACK_TRACES` - Show stack traces (default: enabled)
+  - `1` or unset: Show compact stack traces (top 7 frames)
+  - `0`: Hide stack traces, show only addresses
 
 ## How It Works
 
@@ -50,13 +65,31 @@ At program exit, we report any allocations that were never freed = **memory leak
 
 ## Example Output
 
+**Memory Leak Detection:**
 ```
-========== MEMORY LEAK REPORT ==========
-[LEAK] 0x55555555a2a0: 1024 bytes (allocated at timestamp 1730678400)
-[LEAK] 0x55555555a6b0: 512 bytes (allocated at timestamp 1730678400)
+========== MEMORY LEAKS ==========
+[LEAK] 0x55555555a2a0: 1024 bytes
+./libprofiler.so(malloc+0x84)[0x7f...]
+./your_program(create_buffer+0x1a)[0x55...]
+./your_program(main+0x43)[0x55...]
 
-Summary: 2 leaks, 1536 bytes total
-========================================
+[LEAK] 0x55555555a6b0: 512 bytes
+./libprofiler.so(malloc+0x84)[0x7f...]
+./your_program(helper_function+0x30)[0x55...]
+./your_program(main+0xd4)[0x55...]
+
+Summary:
+  Real leaks: 2 allocation(s), 1536 bytes
+  Libc infrastructure: 1 allocation(s), 1024 bytes (ignored)
+==================================
+```
+
+**Corruption Detection:**
+```
+[CORRUPTION] Double-Free or Invalid-Free at 0x55555555a2a0
+./libprofiler.so(+0x15dd)[0x7f...]
+./libprofiler.so(free+0x85)[0x7f...]
+./your_program(main+0x8b)[0x55...]
 ```
 
 ## Project Structure
@@ -64,16 +97,20 @@ Summary: 2 leaks, 1536 bytes total
 ```
 c-systems-integrity-lib/
 ├── src/
-│   ├── profiler.c           # LD_PRELOAD interception layer
-│   └── alloc_tracker.c      # Hash table for tracking allocations
+│   ├── malloc_intercept.c   # LD_PRELOAD interception + corruption detection
+│   ├── hash_table.c         # O(1) allocation tracking with uthash
+│   └── profiler.c           # Library initialization
 ├── include/
-│   └── profiler_internal.h  # Internal data structures
+│   ├── profiler_internal.h  # Internal data structures
+│   └── uthash.h             # Third-party hash table library
 ├── tests/
-│   ├── test_simple_leak.c   # Test with intentional leaks
-│   └── test_no_leak.c       # Test with proper cleanup
+│   ├── test_simple_leak.c   # Basic leak detection
+│   ├── test_no_leak.c       # Zero-leak verification
+│   ├── test_complex_leak.c  # Real-world simulation (7 leaks)
+│   ├── test_double_free.c   # Double-free detection (4 scenarios)
+│   └── test_invalid_free.c  # Invalid-free detection (5 scenarios)
 ├── Makefile                 # Build system
-├── BUILD_GUIDE.md          # Detailed build instructions
-└── CMemoryLeaker.md        # Full project specification
+└── CMemoryLeaker.md         # Full project specification
 ```
 
 ## Design Principles

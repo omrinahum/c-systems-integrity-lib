@@ -1,8 +1,9 @@
 /*
- * Hash Table - Allocation Registry
+ * hash table - allocation registry
  * 
- * Manages a hash table of active memory allocations.
- * Currently using a simple linked list (will upgrade to uthash later).
+ * manages a hash table of active memory allocations.
+ * uses uthash for O(1) performance.
+ * thread-safe with pthread mutex.
  */
 
 #define _GNU_SOURCE  
@@ -11,36 +12,41 @@
 #include <time.h>
 #include <string.h>
 #include <execinfo.h>  
-#include <unistd.h>     
+#include <unistd.h>
+#include <pthread.h>     
 #include "../include/profiler_internal.h"
+#include "../include/uthash.h"
 
-// Global state
+// global state
 static allocation_info_t *g_allocations = NULL;
 
+// mutex to protect hash table from concurrent access
+// PTHREAD_MUTEX_INITIALIZER: static initialization, safe before any threads exist
+static pthread_mutex_t hash_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /*
- * Initialize the tracker
- * Currently does nothing, but we'll add mutex initialization here later
+ * initialize the tracker
+ * 
+ * currently minimal - just resets the allocation list.
  */
 void hash_table_init(void) {
     g_allocations = NULL;
-    fprintf(stderr, "[PROFILER] Hash table initialized\n");
 }
 
 /*
- * Add an allocation to our tracking table
+ * add an allocation to our tracking table
  * 
- * Called immediately after malloc() succeeds.
- * We allocate memory for the metadata itself - this is important:
- * we use the REAL malloc, not our intercepted one (to avoid recursion)
+ * called immediately after malloc() succeeds.
+ * we use real_malloc_ptr to allocate metadata (avoids recursion).
+ * uthash's HASH_ADD_PTR does O(1) insertion.
  */
-void hash_table_add(void *ptr, size_t size ,void **trace, int depth) {
-    if (!ptr) return;  // Don't track NULL returns
+void hash_table_add(void *ptr, size_t size ,void **trace, int depth, int is_suspicious) {
+    if (!ptr) return;
     
-    // Don't track if real_malloc_ptr isn't set yet (during early init)
+    // don't track if real_malloc_ptr isn't set yet (during early init)
     if (!real_malloc_ptr) return;
     
-    // Allocate metadata structure node (for now) using real malloc from lib.c
-    // This prevents infinite recursion
+    // allocate metadata structure using real malloc (prevents infinite recursion)
     allocation_info_t *info = (allocation_info_t*)real_malloc_ptr(sizeof(allocation_info_t));
     if (!info) {
         fprintf(stderr, "[PROFILER ERROR] Failed to allocate tracking metadata\n");
@@ -50,122 +56,167 @@ void hash_table_add(void *ptr, size_t size ,void **trace, int depth) {
     info->ptr = ptr;
     info->size = size;
     info->timestamp = time(NULL);
+    info->is_suspicious = is_suspicious;
     
-    // Allocate and copy stack trace
+    // allocate and copy stack trace
     info->stack_trace = real_malloc_ptr(depth * sizeof(void*));
-    // copy the trace stack data into the sturct array
     if (info->stack_trace) {
         memcpy(info->stack_trace, trace, depth * sizeof(void*));
         info->stack_depth = depth;
     } else {
-        info->stack_depth = 0;  // Allocation failed, no trace
+        info->stack_depth = 0;
     }
     
-    // Add to front of linked list
-    info->next = g_allocations;
-    g_allocations = info;
+    // lock before modifying shared hash table
+    pthread_mutex_lock(&hash_table_mutex);
+    
+    // add to hash table - O(1) operation
+    // for me : HASH_ADD_PTR(head, keyfield, item)
+    HASH_ADD_PTR(g_allocations, ptr, info);
+    
+    // unlock after modification complete
+    pthread_mutex_unlock(&hash_table_mutex);
 }
 
 /*
- * Remove an allocation from tracking
+ * remove an allocation from tracking
  * 
- * Called when free() is called. We search for the pointer
- * and remove it from our list. If not found, it's either:
- * 1. A double-free (freed twice)
- * 2. An invalid free (never allocated)
+ * called when free() is called.
+ * uthash's HASH_FIND_PTR does O(1) lookup.
  * 
- * For now, we'll just remove it. Later we'll add error detection.
+ * thread safety: protected by hash_table_mutex
  */
 void hash_table_remove(void *ptr) {
     if (!ptr) return;
     
-    // set for the linked list search
-    allocation_info_t *current = g_allocations;
-    allocation_info_t *prev = NULL;
+    allocation_info_t *found;
     
-    // Search for the allocation
-    while (current) {
-        if (current->ptr == ptr) {
-            // Found it - remove from list
-            if (prev) {
-                prev->next = current->next;
-            } else {
-                g_allocations = current->next;
-            }
-            // Free the stack trace array first, then the struct
-            if (current->stack_trace) {
-                real_free_ptr(current->stack_trace);
-            }
-            real_free_ptr(current);  // Free the metadata using real free
-            return;
-        }
-        prev = current;
-        current = current->next;
+    // lock before accessing shared hash table
+    pthread_mutex_lock(&hash_table_mutex);
+    
+    // find the entry in hash table - O(1) operation
+    // for me : HASH_FIND_PTR(head, key_ptr, output)
+    HASH_FIND_PTR(g_allocations, &ptr, found);
+    
+    if (found) {
+        // remove from hash table - O(1) operation
+        HASH_DEL(g_allocations, found);
     }
     
-    // Not found - this is a bug in the application
-    // For now, just ignore. We'll add detection in Phase 4
+    // unlock before freeing memory (don't need lock for that)
+    pthread_mutex_unlock(&hash_table_mutex);
+    
+    // free outside the critical section 
+    if (found) {
+        // free the stack trace array first, then the struct
+        if (found->stack_trace) {
+            real_free_ptr(found->stack_trace);
+        }
+        real_free_ptr(found);
+    }
+    
+    // not found - could be double-free or invalid-free
+    // for now, just ignore. we'll add detection in phase 4
 }
 
 /*
- * Report all leaked allocations
+ * check if an allocation exists in the hash table
  * 
- * Called at program exit. Anything still in our hash table
- * was allocated but never freed = memory leak.
+ * called by free() to validate pointer before freeing.
+ * returns 1 if found, 0 if not found.
+ * 
+ * thread safety: protected by hash_table_mutex
+ */
+int hash_table_find(void *ptr) {
+    if (!ptr) return 0;
+    
+    allocation_info_t *found;
+    
+    // lock before accessing shared hash table
+    pthread_mutex_lock(&hash_table_mutex);
+    
+    // find the entry in hash table - O(1) operation
+    HASH_FIND_PTR(g_allocations, &ptr, found);
+    
+    // unlock immediately after lookup
+    pthread_mutex_unlock(&hash_table_mutex);
+    
+    return (found != NULL) ? 1 : 0;
+}
+
+/*
+ * report all leaked allocations
+ * 
+ * called at program exit.
+ * anything still in our table was allocated but never freed = memory leak.
+ * uses HASH_ITER to safely iterate through all hash table entries.
+ * 
+ * separates output into confirmed leaks vs suspicious leaks (likely libc).
  */
 void hash_table_report_leaks(void) {
-    // set start node
-    allocation_info_t *current = g_allocations;
-    int leak_count = 0;
-    size_t total_leaked = 0;
+    allocation_info_t *current, *tmp;
+    int confirmed_count = 0;
+    int suspicious_count = 0;
+    size_t confirmed_bytes = 0;
+    size_t suspicious_bytes = 0;
     
-    fprintf(stderr, "\n========== MEMORY LEAK REPORT ==========\n");
-    
-    // iterate thorugh all the reamin nodes and print thier metadata
-    while (current) {
-        fprintf(stderr, "[LEAK] %p: %zu bytes (allocated at timestamp %ld)\n",
-                current->ptr, current->size, (long)current->timestamp);
-        
-        // Print stack trace if available
-        if (current->stack_trace && current->stack_depth > 0) {
-            fprintf(stderr, "  Allocated at:\n");
-            // for me : backtrace_symbols_fd args: addresses (array), count (int), file_descriptor;
-            backtrace_symbols_fd(current->stack_trace, current->stack_depth, STDERR_FILENO);
+    // first pass: count and report confirmed leaks (user code)
+    HASH_ITER(hh, g_allocations, current, tmp) {
+        if (!current->is_suspicious) {
+            if (confirmed_count == 0) {
+                fprintf(stderr, "\n========== MEMORY LEAKS ==========\n");
+            }
+            fprintf(stderr, "[LEAK] %p: %zu bytes\n", current->ptr, current->size);
+            
+            // show stack trace if enabled (compact format - top 7 frames only)
+            if (show_stack_traces && current->stack_trace && current->stack_depth > 0) {
+                int frames_to_show = (current->stack_depth < 7) ? current->stack_depth : 7;
+                backtrace_symbols_fd(current->stack_trace, frames_to_show, STDERR_FILENO);
+            }
+            fprintf(stderr, "\n");
+            
+            confirmed_count++;
+            confirmed_bytes += current->size;
+        } else {
+            suspicious_count++;
+            suspicious_bytes += current->size;
         }
-        fprintf(stderr, "\n");  
-        
-        leak_count++;
-        total_leaked += current->size;
-        current = current->next;
     }
     
-    if (leak_count == 0) { // everything freed
-        fprintf(stderr, "No memory leaks detected! ✓\n");
-    } else { 
-        fprintf(stderr, "\nSummary: %d leaks, %zu bytes total\n", 
-                leak_count, total_leaked);
+    // summary
+    if (confirmed_count > 0 || suspicious_count > 0) {
+        fprintf(stderr, "\nSummary:\n");
+        fprintf(stderr, "  Real leaks: %d allocation(s), %zu bytes\n", confirmed_count, confirmed_bytes);
+        if (suspicious_count > 0) {
+            fprintf(stderr, "  Libc infrastructure: %d allocation(s), %zu bytes (ignored)\n", 
+                    suspicious_count, suspicious_bytes);
+        }
+        fprintf(stderr, "==================================\n\n");
     }
-    
-    fprintf(stderr, "========================================\n");
 }
 
 /*
- * Cleanup tracker state
+ * cleanup tracker state
  * 
- * Free all tracking metadata. Called at exit.
+ * free all tracking metadata. called at exit.
+ * uses HASH_ITER to safely delete all entries.
+ * 
+ * thread safety: at exit, program is single-threaded, so no need to lock
  */
 void hash_table_cleanup(void) {
-    // set start node
-    allocation_info_t *current = g_allocations;
-    // iterate through the whole remained list and free the memory using the lib.c malloc
-    while (current) {
-        allocation_info_t *next = current->next;
-        // Free stack trace array first, then the struct
+    allocation_info_t *current, *tmp;
+    
+    // iterate through the remain data in the hash and delete them
+    // at program exit, we're single-threaded, so no lock needed
+    HASH_ITER(hh, g_allocations, current, tmp) {
+        HASH_DEL(g_allocations, current);  // remove from hash table
+        
+        // free stack trace array first, then the struct
         if (current->stack_trace) {
             real_free_ptr(current->stack_trace);
         }
         real_free_ptr(current);
-        current = next;
     }
+    
     g_allocations = NULL;
 }

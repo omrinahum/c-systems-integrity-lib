@@ -4,24 +4,27 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#include "uthash.h"  
 
 /* 
- * Allocation metadata stored for each malloc() call
+ * allocation metadata stored for each malloc() call
  * 
- * We store the information needed to detect leaks:
- * - ptr: The address returned by malloc (used as hash key)
- * - size: Number of bytes allocated
- * - timestamp: When allocation occurred (for debugging)
- * - stack_trace: Array of return addresses (from backtrace)
- * - stack_depth: Number of frames captured
+ * we store the information needed to detect leaks:
+ * - ptr: the address returned by malloc (used as hash key)
+ * - size: number of bytes allocated
+ * - timestamp: when allocation occurred
+ * - stack_trace: array of return addresses (from backtrace)
+ * - stack_depth: number of frames captured
+ * - hh: uthash handle (required by uthash library)
  */
 typedef struct allocation_info {
-    void *ptr;              // The allocated address
-    size_t size;            // Bytes allocated
-    time_t timestamp;       // When it was allocated
-    void **stack_trace;     // Array of return addresses
-    int stack_depth;        // Number of frames in stack_trace
-    struct allocation_info *next;  // For linked list (will become uthash later)
+    void *ptr;              // the allocated address (hash key)
+    size_t size;            // bytes allocated
+    time_t timestamp;       // when it was allocated
+    void **stack_trace;     // array of return addresses
+    int stack_depth;        // number of frames in stack_trace
+    int is_suspicious;      // 1 if likely libc false positive, 0 if real leak
+    UT_hash_handle hh;      // uthash handle 
 } allocation_info_t;
 
 /*
@@ -38,13 +41,17 @@ typedef struct profiler_state {
 
 // Function declarations for hash table (allocation tracking)
 void hash_table_init(void);
-void hash_table_add(void *ptr, size_t size, void **trace, int depth);
+void hash_table_add(void *ptr, size_t size, void **trace, int depth, int is_suspicious);
 void hash_table_remove(void *ptr);
+int hash_table_find(void *ptr);  // returns 1 if found, 0 if not
 void hash_table_report_leaks(void);
 void hash_table_cleanup(void);
 
 // Real libc function pointers (set by malloc_intercept.c)
 extern void* (*real_malloc_ptr)(size_t);
 extern void (*real_free_ptr)(void*);
+
+// Configuration (set by malloc_intercept.c)
+extern int show_stack_traces;  // 1 = enabled, 0 = disabled
 
 #endif // PROFILER_INTERNAL_H

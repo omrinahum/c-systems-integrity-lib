@@ -1,22 +1,26 @@
 /*
- * Memory Profiler - Main Interception Layer
+ * memory profiler - main interception layer
  * 
- * This file implements the LD_PRELOAD magic that intercepts malloc/free.
+ * implements the LD_PRELOAD magic that intercepts malloc/free.
  * 
- * HOW IT WORKS:
- * 1. We define malloc() and free() functions here
- * 2. When the program is run with LD_PRELOAD=libprofiler.so, the dynamic
- *    linker loads OUR functions BEFORE libc's
- * 3. Our functions intercept the call, track it, then call the REAL malloc/free
+ * how it works:
+ * 1. we define malloc() and free() functions here
+ * 2. when program runs with LD_PRELOAD=libprofiler.so, the dynamic linker
+ *    loads our functions before libc's
+ * 3. our functions intercept the call, track it, then call the real malloc/free
  * 
- * THE BOOTSTRAP PROBLEM:
- * Our tracking code needs to allocate memory for metadata. If we track
+ * the bootstrap problem:
+ * our tracking code needs to allocate memory for metadata. if we track
  * that allocation, we get infinite recursion:
  *   malloc() -> track() -> malloc() -> track() -> ...
  * 
- * SOLUTION (for now):
- * We'll use a simple flag. When we're inside profiler code, we won't track.
- * Later we'll make this thread-safe with thread-local storage.
+ * solution:
+ * use the 'in_profiler' flag. when inside profiler code, we don't track.
+ * this prevents recursion when our own code (like hash_table_add) calls malloc.
+ * 
+ * why we use write() instead of fprintf():
+ * write() is a direct syscall with zero dependency on libc buffering.
+ * fprintf() can call malloc internally, which would break our initialization.
  */
 
 #define _GNU_SOURCE
@@ -24,127 +28,191 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <string.h>
-#include <execinfo.h>  // For backtrace()
+#include <unistd.h>     
+#include <execinfo.h>  
 #include "../include/profiler_internal.h"
 
-// Maximum stack frames to capture
+// maximum stack frames to capture
 #define MAX_STACK_FRAMES 16
 
-// Function pointers to the lib.c real malloc/free 
+// safe output function - uses direct syscall, never calls malloc
+static void profiler_log(const char *msg) {
+    write(STDERR_FILENO, msg, strlen(msg));
+}
+
+/*
+ * check if allocation likely came from libc infrastructure
+ * 
+ * examines stack trace to detect allocations from libc.so.
+ * these are typically i/o buffers, locale data, etc that uses malloc internally
+ * and intentionally wont be freed (global infrastructure).
+ * 
+ * key insight: we only check the immidiate caller (frame 1).
+ * we only care if libc DIRECTLY called malloc, not user code.
+ * 
+ * stack example for user leak:
+ *   frame 0: malloc (profiler)
+ *   frame 1: main (user code) ← CHECK THIS
+ *   frame 2: __libc_start_main ← ignore (just startup)
+ * 
+ * stack example for libc leak:
+ *   frame 0: malloc (profiler)
+ *   frame 1: _IO_file_doallocate (libc) ← CHECK THIS - it's libc!
+ *   frame 2: puts ← doesn't matter
+ * 
+ * uses dladdr() which:
+ * - does NOT call malloc 
+ * - maps function address to its shared library- so we can detect if its lib.c
+ * 
+ * returns: 1 if suspicious (likely false positive), 0 if real leak
+ */
+static int is_likely_libc_allocation(void **stack_trace, int depth) {
+    if (!stack_trace || depth < 2) {
+        return 0;  // can't determine, assume real
+    }
+    
+    // only check frame 1 (immediate caller of malloc)
+    // frame 0 is malloc itself, frame 1 is who called malloc
+    // dl_info is a struct which holds the inforamtion about the shared libary
+    Dl_info info;
+    
+    // dladdr() fills the 'nfo structure based on the address in trace[1]
+    if (dladdr(stack_trace[1], &info) != 0) {
+        // check if immediate caller is from libc.so
+        if (info.dli_fname && strstr(info.dli_fname, "libc.so")) {
+            return 1;  // direct libc call - suspicious!
+        }
+    }
+    
+    return 0;  // not from libc - likely user code
+}
+
+/*
+ * report memory corruption error
+ * 
+ * called when we detect double-free or invalid-free.
+ * reports immediately (doesn't wait for program exit).
+ * 
+ * shows error type, address, and compact stack trace (top 7 frames).
+ * stack trace can be disabled with PROFILER_STACK_TRACES=0
+ */
+static void report_corruption_error(void *ptr, const char *error_type) {
+    char msg[128];
+    int len;
+    
+    len = snprintf(msg, sizeof(msg), 
+                   "[CORRUPTION] %s at %p\n",
+                   error_type, ptr);
+    write(STDERR_FILENO, msg, len);
+    
+    // show compact stack trace if enabled (top 7 frames only)
+    if (show_stack_traces) {
+        void *stack_trace[MAX_STACK_FRAMES];
+        int depth = backtrace(stack_trace, MAX_STACK_FRAMES);
+        int frames_to_show = (depth < 7) ? depth : 7;
+        backtrace_symbols_fd(stack_trace, frames_to_show, STDERR_FILENO);
+        write(STDERR_FILENO, "\n", 1);
+    }
+}
+
+// function pointers to the real libc malloc/free 
 static void* (*real_malloc)(size_t) = NULL;
 static void (*real_free)(void*) = NULL;
 static void* (*real_calloc)(size_t, size_t) = NULL;
 static void* (*real_realloc)(void*, size_t) = NULL;
 
-// Export these for hash_table.c to use
+// export these for hash_table.c to use
 void* (*real_malloc_ptr)(size_t) = NULL;
 void (*real_free_ptr)(void*) = NULL;
+int show_stack_traces = 1;  // exported configuration
 
-// Bootstrap protection - prevents tracking our own allocations
+// bootstrap protection - prevents tracking our own allocations
 static int in_profiler = 0;
 
-// Initialization flags  
+// initialization flags  
 static int profiler_initialized = 0;
-static int first_malloc_done = 0;
+static int profiler_shutting_down = 0;  // skip validation during cleanup
 
 /*
- * Initialize the profiler
+ * initialize the profiler
  * 
- * This is called once, on the first malloc/free call.
- * We use dlsym() to get pointers to the real libc functions.
- * 
+ * called once on first malloc/free call.
+ * uses dlsym() to get pointers to the real libc functions.
  */
 static void profiler_init(void) {
     if (profiler_initialized) return;
     
-    // Mark as initialized to prevent re-entry
     profiler_initialized = 1;
     
-    // Prevent recursion during initialization 
-    in_profiler = 1;
+    // read configuration from environment variables
+    const char *env_stack_traces = getenv("PROFILER_STACK_TRACES");
+    if (env_stack_traces && strcmp(env_stack_traces, "0") == 0) {
+        show_stack_traces = 0;  // disabled
+    }
     
-    // Get real function pointers before any output
-    // for me: dlsym gets the next implemntation of the second arg (eg malloc) function 
-    // in the linking- in our instacne the lib.c ones
+    // get real function pointers using dlsym
     real_malloc = dlsym(RTLD_NEXT, "malloc");
     real_free = dlsym(RTLD_NEXT, "free");
     real_calloc = dlsym(RTLD_NEXT, "calloc");
     real_realloc = dlsym(RTLD_NEXT, "realloc");
     
-    // coudlnt catch the lib.c fucntions- exit
+    // verify we found the real functions
     if (!real_malloc || !real_free) {
-        fprintf(stderr, "[PROFILER ERROR] Failed to find real malloc/free\n");
-        exit(1);
+        profiler_log("[PROFILER ERROR] Failed to find real malloc/free\n");
+        _exit(1);  
     }
     
-    // Export for hash_table to use
+    // export for hash_table.c to use
     real_malloc_ptr = real_malloc;
     real_free_ptr = real_free;
     
-    // Now we can print (fprintf may call malloc internally)
-    fprintf(stderr, "[PROFILER] Initializing memory profiler...\n");
-    
-    // Initialize our tracking system
+    // initialize tracking system
     hash_table_init();
-    
-    fprintf(stderr, "[PROFILER] Initialization complete\n");
-    // turn off the flag so we could keep track
-    in_profiler = 0;
 }
 
 /*
- * Cleanup function - called at program exit
+ * cleanup function - called at program exit
  * 
- * We use __attribute__((destructor)) to tell GCC to call this 
- * automatically when the shared library is unloaded (program exit).
- * when it happends we create the report
+ * uses __attribute__((destructor)) to run automatically when the 
+ * shared library is unloaded.
  */
 __attribute__((destructor))
 static void profiler_cleanup(void) {
-    fprintf(stderr, "[PROFILER] Generating final report...\n");
+    profiler_shutting_down = 1;  // disable corruption detection during cleanup
     hash_table_report_leaks();
     hash_table_cleanup();
 }
 
 /*
- * INTERCEPTED malloc()
+ * intercepted malloc()
  * 
- * This is the function that gets called instead of libc's malloc.
- * 
- * Flow:
- * 1. Initialize profiler if first call
- * 2. Call real malloc
- * 3. Track the allocation (unless we're already in profiler code)
- * 4. Return the pointer
+ * this gets called instead of libc's malloc.
+ * we track the allocation then call the real malloc.
  */
 void* malloc(size_t size) {
-    // Initialize on first call
+    // initialize on first call
     if (!profiler_initialized) {
         profiler_init();
     }
     
-    // Call the real malloc and save the adress
+    // call the real malloc
     void *ptr = real_malloc(size);
     
-    // temp soltion:Skip tracking until after first malloc completes-
-    // im assuming first malloc would be for printf buffers- so i drop it for now 
-    if (!first_malloc_done) {
-        first_malloc_done = 1;
-        return ptr;
-    }
-    
-    // Track it only if were not in the profiler code- so we can prevent infinity loops 
-    // for me: eg malloc() -> track() -> malloc() -> track() -> ...
+    // track it only if we're not in the profiler code (prevents recursion) 
+    // for me: eg malloc -> track -> malloc -> track -> ...
     if (!in_profiler && ptr) {
         in_profiler = 1;
         
-        // Capture stack trace- backtrace is keeping the return address in the trace array (all of the stack return addresses)
-        // lets say main calls help calls help 2, both main and help get inside the array, also return the depth of the stack
+        // capture stack trace - backtrace stores return addresses in the array
+        // eg: main -> helper -> helper2, both main and helper are in the array
         void *trace[MAX_STACK_FRAMES];
         int depth = backtrace(trace, MAX_STACK_FRAMES);
         
-        // Track the allocation with stack trace
-        hash_table_add(ptr, size, trace, depth);
+        // check if this looks like libc infrastructure allocation
+        int is_suspicious = is_likely_libc_allocation(trace, depth);
+        
+        // track the allocation with stack trace and suspicion flag
+        hash_table_add(ptr, size, trace, depth, is_suspicious);
         in_profiler = 0;
     }
     
@@ -152,52 +220,78 @@ void* malloc(size_t size) {
 }
 
 /*
- * INTERCEPTED free()
+ * intercepted free()
  * 
- * Similar to malloc - intercept, track, delegate.
+ * validates pointer before freeing to detect corruption bugs of double free or an invalid free
+ * 
+ * if corruption is detected, reports error immediately and skips the free
+ * to prevent crashes or heap corruption.
  */
 void free(void *ptr) {
-    // Initialize if needed (shouldn't happen, but be safe)
+    // initialize if needed (shouldn't happen, but be safe)
     if (!profiler_initialized) {
         profiler_init();
     }
     
-    // Don't free NULL 
+    // don't free NULL 
     if (!ptr) return;
     
-    // Remove from tracking
+    // skip validation during profiler shutdown (cleanup frees internal metadata)
+    if (profiler_shutting_down) {
+        real_free(ptr);
+        return;
+    }
+    
+    // validate and remove from tracking
     if (!in_profiler) {
         in_profiler = 1;
+        
+        // check if this pointer exists in our tracking table
+        int found = hash_table_find(ptr);
+        
+        if (!found) {
+            // pointer not in table - either double-free or invalid-free
+            // report the error immediately
+            report_corruption_error(ptr, "Double-Free or Invalid-Free");
+            in_profiler = 0;
+            
+            // don't call real_free() - would crash or corrupt heap!
+            return;
+        }
+        
+        // valid free - remove from tracking
         hash_table_remove(ptr);
         in_profiler = 0;
     }
     
-    // Call real free
+    // call real free
     real_free(ptr);
 }
 
 /*
- * INTERCEPTED calloc()
+ * intercepted calloc()
  * 
- * calloc allocates AND zeros memory. track it like malloc.
+ * calloc allocates and zeros memory. track it like malloc.
  */
 void* calloc(size_t nmemb, size_t size) {
     if (!profiler_initialized) {
         profiler_init();
     }
     
-    // call real lib.c calloc and track it
+    // call real calloc and track it
     void *ptr = real_calloc(nmemb, size);
     
-    // when pointer isnt null and its the first calloc, track
     if (!in_profiler && ptr) {
         in_profiler = 1;
         
-        // Capture stack trace
+        // capture stack trace
         void *trace[MAX_STACK_FRAMES];
         int depth = backtrace(trace, MAX_STACK_FRAMES);
         
-        hash_table_add(ptr, nmemb * size, trace, depth);
+        // check if this looks like libc infrastructure allocation
+        int is_suspicious = is_likely_libc_allocation(trace, depth);
+        
+        hash_table_add(ptr, nmemb * size, trace, depth, is_suspicious);
         in_profiler = 0;
     }
     
@@ -205,43 +299,44 @@ void* calloc(size_t nmemb, size_t size) {
 }
 
 /*
- * INTERCEPTED realloc()
+ * intercepted realloc()
  * 
- * - If ptr is NULL, acts like malloc
- * - If size is 0, acts like free
- * - Otherwise, may move the allocation to a new address
- * 
- * We need to remove the old tracking and add new tracking.
+ * realloc can act like malloc (if ptr is NULL), free (if size is 0),
+ * or move the allocation to a new address.
+ * we remove old tracking and add new tracking.
  */
 void* realloc(void *ptr, size_t size) {
     if (!profiler_initialized) {
         profiler_init();
     }
     
-    // If ptr is NULL, this is just malloc
+    // if ptr is NULL, this is just malloc
     if (!ptr) {
         return malloc(size);
     }
     
-    // If size is 0, this is just free
+    // if size is 0, this is just free
     if (size == 0) {
         free(ptr);
         return NULL;
     }
     
-    // Call real realloc from lib.c
+    // call real realloc
     void *new_ptr = real_realloc(ptr, size);
     
-    // Update tracking: remove old, add new
+    // update tracking: remove old, add new
     if (!in_profiler) {
         in_profiler = 1;
         hash_table_remove(ptr);
         if (new_ptr) {
-            // Capture stack trace
+            // capture stack trace
             void *trace[MAX_STACK_FRAMES];
             int depth = backtrace(trace, MAX_STACK_FRAMES);
             
-            hash_table_add(new_ptr, size, trace, depth);
+            // check if this looks like libc infrastructure allocation
+            int is_suspicious = is_likely_libc_allocation(trace, depth);
+            
+            hash_table_add(new_ptr, size, trace, depth, is_suspicious);
         }
         in_profiler = 0;
     }

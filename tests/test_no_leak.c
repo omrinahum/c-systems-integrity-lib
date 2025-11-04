@@ -13,38 +13,33 @@ int main() {
     printf("Test: No Memory Leaks\n");
     printf("=====================\n\n");
     
-    // Allocate and free multiple times
+    // allocate and free multiple times
     for (int i = 0; i < 5; i++) {
-        printf("Iteration %d: Allocating 1024 bytes...\n", i);
         void *ptr = malloc(1024);
         if (ptr) {
             memset(ptr, i, 1024);
-            printf("  Address: %p\n", ptr);
             free(ptr);
-            printf("  Freed\n");
         }
     }
+    printf("loop(5x): freed \n");
     
-    // Test calloc
-    printf("\nTesting calloc (2048 bytes)...\n");
+    // test calloc
     void *ptr2 = calloc(512, 4);
     if (ptr2) {
-        printf("  Address: %p\n", ptr2);
         free(ptr2);
-        printf("  Freed\n");
     }
+    printf("calloc: freed \n");
     
-    // Test realloc
-    printf("\nTesting realloc...\n");
+    // test realloc
     void *ptr3 = malloc(100);
-    printf("  Initial address: %p (100 bytes)\n", ptr3);
     ptr3 = realloc(ptr3, 200);
-    printf("  After realloc: %p (200 bytes)\n", ptr3);
     free(ptr3);
-    printf("  Freed\n");
+    printf("realloc: freed \n\n");
     
-    printf("\nProgram ending...\n");
-    printf("Expected: NO memory leaks detected\n");
+    printf("==========================================\n");
+    printf("Expected Leaks: 0 allocations\n");
+    printf("All memory properly freed\n");
+    printf("==========================================\n");
     
     return 0;
 }
