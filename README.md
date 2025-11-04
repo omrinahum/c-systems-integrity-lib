@@ -2,7 +2,6 @@
 
 A low-level C library for Linux that automatically detects memory leaks, double-free errors, file descriptor leaks, and concurrency deadlocks in C/C++ applications **without recompilation**.
 
-## Current Status: Phase 6 ✓
 
 **Working Features:**
 - ✅ malloc/free/calloc/realloc interception via LD_PRELOAD
